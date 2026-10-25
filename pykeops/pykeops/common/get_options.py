@@ -14,7 +14,7 @@ class SetBackend:
     This class is  used to centralized the options used in PyKeops.
     """
 
-    dev = OrderedDict([("CPU", 0), ("GPU", 1)])
+    dev = OrderedDict([("CPU", 0), ("GPU", 1), ("WebGPU", 2)])
     grid = OrderedDict([("1D", 0), ("2D", 1)])
     memtype = OrderedDict([("host", 0), ("device", 1)])
 
@@ -28,6 +28,7 @@ class SetBackend:
         "GPU_2D",
         "GPU_2D_device",
         "GPU_2D_host",
+        "WebGPU",
     ]
 
     def define_tag_backend(self, backend, variables):
@@ -38,6 +39,7 @@ class SetBackend:
            GPU_2D_device : computations performed on the device from device arrays, using the 2D scheme
            GPU_1D_host : computations performed on the device from host arrays, using the 1D scheme
            GPU_2D_host : computations performed on the device from host data, using the 2D scheme
+           WebGPU : computations performed with the WebGPU API (wgpu library) from host arrays, using the 1D scheme
 
         :param backend (str), variables (tuple)
 

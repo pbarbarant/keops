@@ -97,6 +97,8 @@ class LoadKeOps:
 
         if tagCPUGPU == 0:
             map_reduce_id = "CpuReduc"
+        elif tagCPUGPU == 2:
+            map_reduce_id = "WgslReduc1D"
         else:
             map_reduce_id = "GpuReduc"
             map_reduce_id += "1D" if tag1D2D == 0 else "2D"

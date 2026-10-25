@@ -2,7 +2,7 @@ import copy
 
 import torch
 from pykeops.common.get_options import get_tag_backend
-from pykeops.common.keops_io import keops_binder
+from pykeops.common.keops_io import get_keops_binder
 from pykeops.common.operations import ConjugateGradientSolver
 from pykeops.common.parse_type import (
     get_type,
@@ -41,7 +41,7 @@ class KernelSolveAutograd(torch.autograd.Function):
             tagCPUGPU, tagHostDevice, params.device_id_request, *args
         )
 
-        myconv = keops_binder["nvrtc" if tagCPUGPU else "cpp"](
+        myconv = get_keops_binder(tagCPUGPU)(
             tagCPUGPU,
             tag1D2D,
             tagHostDevice,

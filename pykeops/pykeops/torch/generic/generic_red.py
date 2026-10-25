@@ -94,9 +94,9 @@ class GenredAutograd_base:
             tagCPUGPU, tagHostDevice, params.device_id_request, *args
         )
 
-        from pykeops.common.keops_io import keops_binder
+        from pykeops.common.keops_io import get_keops_binder
 
-        myconv = keops_binder["nvrtc" if tagCPUGPU else "cpp"](
+        myconv = get_keops_binder(tagCPUGPU)(
             tagCPUGPU,
             tag1D2D,
             tagHostDevice,
