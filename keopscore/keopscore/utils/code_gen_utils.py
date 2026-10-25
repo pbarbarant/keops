@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from hashlib import sha256
 
 import keopscore.config
@@ -8,6 +9,64 @@ def get_hash_name(*args):
     return sha256("".join(list(str(arg) for arg in args)).encode("utf-8")).hexdigest()[
         :10
     ]
+
+
+#######################################################################
+# .  Target language : C++/Cuda (default) or WGSL (WebGPU backend)
+#######################################################################
+
+# The helpers below emit C++ code by default. Inside a "with wgsl_codegen():"
+# block they emit WGSL code instead. Variables keep their C++ dtype names
+# ("float", "int", ...) internally ; only the emitted code changes.
+target_lang = "c"
+
+
+@contextmanager
+def wgsl_codegen():
+    global target_lang
+    old_lang, target_lang = target_lang, "wgsl"
+    try:
+        yield
+    finally:
+        target_lang = old_lang
+
+
+def is_wgsl():
+    return target_lang == "wgsl"
+
+
+wgsl_dtypes = {"float": "f32", "int": "i32", "signed long int": "i32", "bool": "bool"}
+
+
+def wgsl_dtype(dtype):
+    # N.B. WGSL has no 64 bits integers, so "signed long int" is mapped to i32.
+    if dtype not in wgsl_dtypes:
+        KeOps_Error(f"dtype {dtype} is not supported by the WebGPU backend.")
+    return wgsl_dtypes[dtype]
+
+
+def split_offset(array_id):
+    # WGSL has no pointer arithmetic, so a C++ array id such as "((xi+3)+k)"
+    # is split into its base "xi" and offset "3+k".
+    if array_id[0] != "(" or array_id[-1] != ")":
+        return array_id, None
+    depth = 0
+    for pos, char in enumerate(array_id[1:-1]):
+        depth += {"(": 1, ")": -1}.get(char, 0)
+        if char == "+" and depth == 0:
+            base, offset = split_offset(array_id[1 : pos + 1].strip())
+            offset2 = array_id[pos + 2 : -1].strip()
+            return base, offset2 if offset is None else f"{offset}+{offset2}"
+    return array_id, None
+
+
+def index_code(array_id, index_id):
+    # returns code string for array_id[index_id]
+    if is_wgsl():
+        base, offset = split_offset(array_id)
+        if offset is not None:
+            return f"{base}[{offset}+{index_id}]"
+    return f"{array_id}[{index_id}]"
 
 
 #######################################################################
@@ -65,9 +124,13 @@ class c_variable:
         return self.id
 
     def declare(self):
+        if is_wgsl():
+            return f"var {self.id}: {wgsl_dtype(self.dtype)};\n"
         return f"{self.dtype} {self.id};\n"
 
     def declare_assign(self, value):
+        if is_wgsl():
+            return self.declare() + self.assign(value)
         return f"{self.dtype} " + self.assign(value)
 
     def assign(self, value):
@@ -78,6 +141,8 @@ class c_variable:
                 dtype = "float"
             return self.assign(c_variable(dtype, str(value)))
         elif type(value) == str:
+            if is_wgsl():
+                return f"{self.id} = {wgsl_dtype(self.dtype)}({value});\n"
             return f"{self.id} = ({self.dtype})({value});\n"
         elif value.dtype != self.dtype:
             if self.dtype == "float2" and value.dtype == "float":
@@ -98,6 +163,8 @@ class c_variable:
                 c_dtype = "float"
             return self.add_assign(c_variable(c_dtype, str(value)))
         if type(value) == str:
+            if is_wgsl():
+                return f"{self.id} += {wgsl_dtype(self.dtype)}({value});\n"
             return f"{self.id} += ({self.dtype})({value});\n"
         elif value.dtype != self.dtype:
             if self.dtype == "float2" and value.dtype == "half2":
@@ -190,6 +257,10 @@ class c_variable:
                 f"The two possible output of a ternary operator should have the same dtype, "
                 f"found {out_true.dtype} and {out_false.dtype}."
             )
+        if is_wgsl():
+            return c_variable(
+                out_true.dtype, f"select({out_false.id}, {out_true.id}, {self.id})"
+            )
         return c_variable(
             out_true.dtype, f"({self.id} ? {out_true.id} : {out_false.id})"
         )
@@ -206,13 +277,13 @@ class c_variable:
                 KeOps_Error(
                     "v[i] with i and v c_variable requires i.dtype='int' or i.dtype='signed long int' "
                 )
-            return c_variable(value(self.dtype), f"{self.id}[{other.id}]")
+            return c_variable(value(self.dtype), index_code(self.id, other.id))
         else:
             KeOps_Error("not implemented")
 
 
 def use_pragma_unroll(n=64):
-    if keopscore.config.cxx.get_disable_pragma_unrolls():
+    if is_wgsl() or keopscore.config.cxx.get_disable_pragma_unrolls():
         return "\n"
     else:
         if n is None:
@@ -245,6 +316,12 @@ def c_for_loop(start, end, incr, pragma_unroll=False):
         string = ""
         if pragma_unroll:
             string += use_pragma_unroll()
+        if is_wgsl():
+            string += f""" for(var {k.id}: i32={start}; {k.id}<{end}; {k.id}+=({incr})) {{
+                            {body_code}
+                        }}
+                    """
+            return string
         string += f""" for({type_inc} {k.id}={start}; {k.id}<{end}; {k.id}+=({incr})) {{
                             {body_code}
                         }}
@@ -263,7 +340,10 @@ def neg_infinity(dtype):
 
 
 def infinity(dtype):
-    if dtype == "float":
+    if is_wgsl() and dtype == "float":
+        # N.B. 1.0f/0.0f is a compile-time error in WGSL
+        code = "bitcast<f32>(0x7f800000u)"
+    elif dtype == "float":
         code = "( 1.0f/0.0f )"
     elif dtype == "double":
         code = "( 1.0/0.0 )"
@@ -277,7 +357,9 @@ def infinity(dtype):
 def cast_to(dtype, var):
     # returns C++ code string to do a cast ; e.g. "(float)" if dtype is "float" for example
     simple_dtypes = ["float", "double", "int", "signed long int", "bool"]
-    if (dtype in simple_dtypes) and (var.dtype in simple_dtypes):
+    if is_wgsl():
+        return f"{wgsl_dtype(dtype)}({var.id})"
+    elif (dtype in simple_dtypes) and (var.dtype in simple_dtypes):
         return f"({dtype})({var.id})"
     elif dtype == "half2" and var.dtype == "float":
         return f"__float2half2_rn({var.id})"
@@ -293,8 +375,12 @@ def value(x):
     # either convert c_array or c_variable representing a pointer to its value c_variable (dereference)
     # or converts string "dtype*" to "dtype"
     if isinstance(x, c_array):
+        if is_wgsl():
+            return x[0]
         return c_variable(x.dtype, f"(*{x.id})")
     if isinstance(x, c_variable):
+        if is_wgsl():
+            return x[0]
         return c_variable(value(x.dtype), f"(*{x.id})")
     elif isinstance(x, str):
         if x[-1] == "*":
@@ -334,7 +420,9 @@ class c_array:
     def declare(self):
         # returns C++ code to declare a fixed-size arry of size dim,
         # skipping declaration if dim=0
-        if self.dim > 0:
+        if self.dim > 0 and is_wgsl():
+            return f"var {self.c_var.id}: array<{wgsl_dtype(self.dtype)}, {self.dim}>;"
+        elif self.dim > 0:
             return f"{self.dtype} {self.c_var.id}[{self.dim}];"
         else:
             return ""
@@ -364,7 +452,7 @@ class c_array:
                 KeOps_Error(
                     "v[i] with i and v c_array requires i.dtype='int' or i.dtype='signed long int' "
                 )
-            return c_variable(self.dtype, f"{self.id}[{other.id}]")
+            return c_variable(self.dtype, index_code(self.id, other.id))
         else:
             KeOps_Error("not implemented")
 
@@ -710,17 +798,18 @@ def load_vars(dims, inds, xloc, args, row_index=c_zero_int, offsets=None, indsre
     string = ""
     if len(dims) > 0:
         string += "{\n"
-        string += "signed long int a=0;\n"
+        string += "var a: i32 = 0;\n" if is_wgsl() else "signed long int a=0;\n"
         for u in range(len(dims)):
             l = indsref.index(inds[u]) if indsref else u
             row_index_str = (
                 f"({row_index.id}+{offsets.id}[{l}])" if offsets else row_index.id
             )
             string += use_pragma_unroll()
-            string += f"for(signed long int v=0; v<{dims[u]}; v++) {{\n"
-            string += (
-                f"    {xloc.id}[a] = {args[inds[u]].id}[{row_index_str}*{dims[u]}+v];\n"
-            )
+            if is_wgsl():
+                string += f"for(var v: i32=0; v<{dims[u]}; v++) {{\n"
+            else:
+                string += f"for(signed long int v=0; v<{dims[u]}; v++) {{\n"
+            string += f"    {index_code(xloc.id, 'a')} = {index_code(args[inds[u]].id, f'{row_index_str}*{dims[u]}+v')};\n"
             string += "     a++;\n"
             string += "}\n"
         string += "}\n"

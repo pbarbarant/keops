@@ -1,4 +1,4 @@
-from keopscore.utils.code_gen_utils import cast_to, c_variable
+from keopscore.utils.code_gen_utils import value
 from keopscore.formulas.Operation import Operation
 from keopscore.formulas.variables.Zero import Zero
 
@@ -18,8 +18,7 @@ class IntCst_Impl(Operation):
         self.dim = 1
 
     def Op(self, out, table):
-        float_val = c_variable("float", f"(float){self.val}")
-        return f"*{out.id} = {cast_to(out.dtype, float_val)};\n"
+        return value(out).assign(float(self.val))
 
     def DiffT(self, v, gradin):
         return Zero(v.dim)

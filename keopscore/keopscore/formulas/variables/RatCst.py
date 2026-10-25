@@ -1,4 +1,4 @@
-from keopscore.utils.code_gen_utils import cast_to, c_variable
+from keopscore.utils.code_gen_utils import value
 from keopscore.formulas.Operation import Operation
 from keopscore.formulas.variables.Zero import Zero
 from keopscore.formulas.variables.IntCst import IntCst
@@ -19,8 +19,7 @@ class RatCst_Impl(Operation):
         self.dim = 1
 
     def Op(self, out, table):
-        float_val = c_variable("float", f"(float)({self.p/self.q})")
-        return f"*{out.id} = {cast_to(out.dtype, float_val)};\n"
+        return value(out).assign(self.p / self.q)
 
     def DiffT(self, v, gradin):
         return Zero(v.dim)

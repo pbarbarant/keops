@@ -2,6 +2,7 @@ from keopscore.utils.code_gen_utils import (
     c_for_loop,
     new_c_varname,
     c_variable,
+    is_wgsl,
 )
 from keopscore.utils.messages import KeOps_Error
 
@@ -10,7 +11,12 @@ from keopscore.config import *
 
 
 def math_function(
-    cpu_code, gpu_code=None, gpu_half2_code=None, gpu_float_code=None, void=False
+    cpu_code,
+    gpu_code=None,
+    gpu_half2_code=None,
+    gpu_float_code=None,
+    wgsl_code=None,
+    void=False,
 ):
     if gpu_code is None:
         gpu_code = cpu_code
@@ -18,6 +24,8 @@ def math_function(
         gpu_half2_code = gpu_code
     if gpu_float_code is None:
         gpu_float_code = gpu_code
+    if wgsl_code is None:
+        wgsl_code = gpu_float_code
 
     def convert_to_fun(code):
         if isinstance(code, str):
@@ -34,6 +42,11 @@ def math_function(
                 args[k] = c_variable(c_dtype, str(arg))
         # N.B. first argument gives main dtype
         dtype = args[0].dtype
+        if is_wgsl():
+            if wgsl_code == "NA":
+                KeOps_Error("Operation is not implemented for the WebGPU backend")
+            string = convert_to_fun(wgsl_code)(*(arg.id for arg in args))
+            return string if void else c_variable(dtype, string)
         if dtype == "half2":
             if gpu_half2_code == "NA":
                 KeOps_Error("Operation is not implemented for half precision")
@@ -78,6 +91,7 @@ keops_sin = math_function(cpu_code="sin", gpu_half2_code="h2sin")
 keops_sinxdivx = math_function(
     cpu_code=lambda x: f"({x} ? sin({x})/{x} : 1.0f)",
     gpu_half2_code=lambda x: f"({h2one}*{h2eq0(x)}+h2sin({x})/({x}+{h2eq0(x)}))",
+    wgsl_code=lambda x: f"select(sin({x})/{x}, 1.0f, {x} == 0.0f)",
 )
 keops_acos = math_function(cpu_code="acos", gpu_half2_code="NA")
 keops_asin = math_function(cpu_code="asin", gpu_half2_code="NA")
@@ -89,15 +103,19 @@ keops_log = math_function(cpu_code="log", gpu_half2_code="h2log")
 keops_xlogx = math_function(
     cpu_code=lambda x: f"({x} ? {x} * log({x}) : 0.0f)",
     gpu_half2_code=lambda x: f"(h2log({x}+{h2eq0(x)})*({x}))",
+    wgsl_code=lambda x: f"select({x} * log({x}), 0.0f, {x} == 0.0f)",
 )
 keops_fma = math_function(cpu_code="fma", gpu_half2_code="__hfma2")
 keops_pow = math_function(
     cpu_code="pow",
     gpu_code="powf",
     gpu_half2_code=lambda x, y: f"(h2exp({int2h2(y)}*h2log({x})))",
+    wgsl_code=lambda x, y: f"(pow(abs({x}), f32({y})) * select(1.0f, -1.0f, {x} < 0.0f && ({y} % 2) != 0))",
 )
 keops_powf = math_function(
-    cpu_code="powf", gpu_half2_code=lambda x, y: f"h2exp({y}*h2log({x}))"
+    cpu_code="powf",
+    gpu_half2_code=lambda x, y: f"h2exp({y}*h2log({x}))",
+    wgsl_code="pow",
 )
 keops_rcp = math_function(cpu_code=lambda x: f"(1.0f/({x}))", gpu_half2_code="h2rcp")
 
@@ -105,6 +123,7 @@ keops_rsqrt = math_function(
     cpu_code=lambda x: f"(({x}==0.0f)? 0.0f : 1.0f/sqrt({x}))",
     gpu_code=lambda x: f"(({x}==0.0f)? 0.0f : rsqrt({x}))",
     gpu_half2_code=lambda x: f"(h2rsqrt({x}+{h2eq0(x)}) * ({h2one}-{h2eq0(x)}))",
+    wgsl_code=lambda x: f"select(inverseSqrt({x}), 0.0f, {x} == 0.0f)",
 )
 
 keops_sqrt = math_function(cpu_code="sqrt", gpu_half2_code="h2sqrt")
@@ -112,47 +131,63 @@ keops_sqrt = math_function(cpu_code="sqrt", gpu_half2_code="h2sqrt")
 keops_relu = math_function(
     cpu_code=lambda x: f"(({x}<0.0f)? 0.0f : {x})",
     gpu_half2_code=lambda x: f"{h2ge0(x)}*({x})",
+    wgsl_code=lambda x: f"select({x}, 0.0f, {x} < 0.0f)",
 )
 
 keops_equal = math_function(
-    cpu_code=lambda x, y: f"(({x}=={y})? 1.0f : 0.0f)", gpu_half2_code="__heq2"
+    cpu_code=lambda x, y: f"(({x}=={y})? 1.0f : 0.0f)",
+    gpu_half2_code="__heq2",
+    wgsl_code=lambda x, y: f"select(0.0f, 1.0f, {x} == {y})",
 )
 
 keops_notequal = math_function(
-    cpu_code=lambda x, y: f"(({x}!={y})? 1.0f : 0.0f)", gpu_half2_code="__hne2"
+    cpu_code=lambda x, y: f"(({x}!={y})? 1.0f : 0.0f)",
+    gpu_half2_code="__hne2",
+    wgsl_code=lambda x, y: f"select(0.0f, 1.0f, {x} != {y})",
 )
 
 keops_lessthan = math_function(
-    cpu_code=lambda x, y: f"(({x}<{y})? 1.0f : 0.0f)", gpu_half2_code="__hlt2"
+    cpu_code=lambda x, y: f"(({x}<{y})? 1.0f : 0.0f)",
+    gpu_half2_code="__hlt2",
+    wgsl_code=lambda x, y: f"select(0.0f, 1.0f, {x} < {y})",
 )
 
 keops_lessorequal = math_function(
-    cpu_code=lambda x, y: f"(({x}<={y})? 1.0f : 0.0f)", gpu_half2_code="__hle2"
+    cpu_code=lambda x, y: f"(({x}<={y})? 1.0f : 0.0f)",
+    gpu_half2_code="__hle2",
+    wgsl_code=lambda x, y: f"select(0.0f, 1.0f, {x} <= {y})",
 )
 
 keops_step = math_function(
-    cpu_code=lambda x: f"(({x}<0.0f)? 0.0f : 1.0f)", gpu_half2_code=h2ge0
+    cpu_code=lambda x: f"(({x}<0.0f)? 0.0f : 1.0f)",
+    gpu_half2_code=h2ge0,
+    wgsl_code=lambda x: f"select(1.0f, 0.0f, {x} < 0.0f)",
 )
 
 keops_sign = math_function(
     cpu_code=lambda x: f"(({x}>0.0f)? 1.0f : ( ({x}<0.0f)? -1.0f : 0.0f ))",
     gpu_half2_code=lambda x: f"{h2ge0(x)}-{h2le0(x)}",
+    wgsl_code="sign",
 )
 
 
 keops_ifelse = math_function(
-    cpu_code=lambda x, a, b: f"(({x}>=0.0f) ? {a} : {b})", gpu_half2_code=h2ifelse
+    cpu_code=lambda x, a, b: f"(({x}>=0.0f) ? {a} : {b})",
+    gpu_half2_code=h2ifelse,
+    wgsl_code=lambda x, a, b: f"select({b}, {a}, {x} >= 0.0f)",
 )
 
 keops_clamp = math_function(
     cpu_code=lambda x, a, b: f"(({x}<{a})? {a} : ( ({x}>{b})? {b} : {x} ))",
     gpu_half2_code=lambda x, a, b: h2ifelse(f"{x}-{a}", h2ifelse(f"{b}-{x}", x, b), a),
+    wgsl_code=lambda x, a, b: f"select(select({x}, {b}, {x} > {b}), {a}, {x} < {a})",
 )
 keops_clampint = math_function(
     cpu_code=lambda x, a, b: f"(({x}<{a})? {a} : ( ({x}>{b})? {b} : {x} ))",
     gpu_half2_code=lambda x, a, b: h2ifelse(
         f"{x}-{int2h2(a)}", h2ifelse(f"{int2h2(b)}-{x}", x, int2h2(b)), int2h2(a)
     ),
+    wgsl_code=lambda x, a, b: f"select(select({x}, f32({b}), {x} > f32({b})), f32({a}), {x} < f32({a}))",
 )
 keops_mod = math_function(
     cpu_code=lambda x, n, d: f"({x} - {n} * floor(({x} - {d})/{n}))",
@@ -163,16 +198,23 @@ keops_round = math_function(
         f"round({x})" if int(d) == 0 else f"(round({x}*{10**int(d)})/{10**int(d)})"
     ),
     gpu_half2_code="NA",
+    wgsl_code=lambda x, d: (
+        f"(sign({x}) * floor(abs({x}) + 0.5f))"
+        if int(d) == 0
+        else f"(sign({x}) * floor(abs({x}) * {10**int(d)} + 0.5f) / {10**int(d)})"
+    ),
 )
 keops_diffclampint = math_function(
     cpu_code=lambda x, a, b: f"(({x}<{a})? 0.0f : ( ({x}>{b})? 0.0f : 1.0f ))",
     gpu_half2_code=lambda x, a, b: h2ifelse(
         f"{x}-{a}", h2ifelse(f"{b}-{x}", h2one, h2zero), h2zero
     ),
+    wgsl_code=lambda x, a, b: f"select(select(1.0f, 0.0f, {x} > f32({b})), 0.0f, {x} < f32({a}))",
 )
 
 keops_sincos = math_function(
     cpu_code=lambda x, s, c: f"*({s})=sin({x}); *({c})=cos({x});",
     gpu_half2_code="NA",
     void=True,
+    wgsl_code="NA",
 )
