@@ -1,3 +1,4 @@
+import re
 from contextlib import contextmanager
 from hashlib import sha256
 
@@ -309,6 +310,11 @@ def c_for_loop(start, end, incr, pragma_unroll=False):
         else:
             KeOps_Error("only simple integer type for loops implemented")
 
+    int_range = (
+        range(start, end, incr)
+        if all(type(x) == int for x in (start, end, incr))
+        else None
+    )
     start, end, incr = map(to_string, (start, end, incr))
     k = c_variable(type_inc, new_c_varname("k"))
 
@@ -316,6 +322,12 @@ def c_for_loop(start, end, incr, pragma_unroll=False):
         string = ""
         if pragma_unroll:
             string += use_pragma_unroll()
+        if is_wgsl() and int_range is not None and len(int_range) <= 64:
+            # WGSL has no "#pragma unroll", so we unroll loops with constant
+            # bounds here : arrays indexed by constants can be kept in registers.
+            for val in int_range:
+                string += "{" + re.sub(rf"\b{k.id}\b", str(val), body_code) + "}\n"
+            return string
         if is_wgsl():
             string += f""" for(var {k.id}: i32={start}; {k.id}<{end}; {k.id}+=({incr})) {{
                             {body_code}
@@ -796,19 +808,27 @@ def load_vars(dims, inds, xloc, args, row_index=c_zero_int, offsets=None, indsre
     #   xi[5] = arg8[(5+offsets[4])*3+1];
     #   xi[6] = arg8[(5+offsets[4])*3+2];
     string = ""
-    if len(dims) > 0:
+    if len(dims) > 0 and is_wgsl():
+        # unrolled version, see c_for_loop
+        a = 0
+        for u in range(len(dims)):
+            l = indsref.index(inds[u]) if indsref else u
+            row_index_str = (
+                f"({row_index.id}+{offsets.id}[{l}])" if offsets else row_index.id
+            )
+            for v in range(dims[u]):
+                string += f"{index_code(xloc.id, a)} = {index_code(args[inds[u]].id, f'{row_index_str}*{dims[u]}+{v}')};\n"
+                a += 1
+    elif len(dims) > 0:
         string += "{\n"
-        string += "var a: i32 = 0;\n" if is_wgsl() else "signed long int a=0;\n"
+        string += "signed long int a=0;\n"
         for u in range(len(dims)):
             l = indsref.index(inds[u]) if indsref else u
             row_index_str = (
                 f"({row_index.id}+{offsets.id}[{l}])" if offsets else row_index.id
             )
             string += use_pragma_unroll()
-            if is_wgsl():
-                string += f"for(var v: i32=0; v<{dims[u]}; v++) {{\n"
-            else:
-                string += f"for(signed long int v=0; v<{dims[u]}; v++) {{\n"
+            string += f"for(signed long int v=0; v<{dims[u]}; v++) {{\n"
             string += f"    {index_code(xloc.id, 'a')} = {index_code(args[inds[u]].id, f'{row_index_str}*{dims[u]}+v')};\n"
             string += "     a++;\n"
             string += "}\n"

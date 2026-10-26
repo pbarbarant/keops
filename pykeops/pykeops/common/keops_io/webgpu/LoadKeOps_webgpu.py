@@ -11,8 +11,9 @@ from pykeops.common.keops_io.LoadKeOps import LoadKeOps
 # max number of workgroups per dimension guaranteed by WebGPU
 max_workgroups = 65535
 
-# max number of (i,j) interactions computed in a single submission to the GPU
-max_interactions = 2**28
+# max number of (i,j) interactions computed in a single submission to the GPU,
+# for variables of total dimension <= 8 (it is reduced for higher dimensions)
+max_interactions = 2**30
 
 _device = None
 
@@ -97,44 +98,59 @@ class LoadKeOps_webgpu_class(LoadKeOps):
             return device.create_buffer_with_data(data=data, usage=usage)
 
         sizes = device.create_buffer(
-            size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
+            size=32, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
         )
         out_size = nx * self.params.dim * 4
         out_buffer = device.create_buffer(
             size=max(out_size, 4),
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
         )
+        acc_buffer = device.create_buffer(
+            size=max(nx * self.params.dimred * 4, 4), usage=wgpu.BufferUsage.STORAGE
+        )
         entries = [
             {"binding": 0, "resource": {"buffer": sizes}},
             {"binding": 1, "resource": {"buffer": out_buffer}},
+            {"binding": 2, "resource": {"buffer": acc_buffer}},
         ]
         for k in self.inds:
             buffer = storage_buffer(self.tools.numpy(self.args[k]))
-            entries.append({"binding": k + 2, "resource": {"buffer": buffer}})
+            entries.append({"binding": k + 3, "resource": {"buffer": buffer}})
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0), entries=entries
         )
 
-        # The workgroups are dispatched by chunks of at most max_interactions
-        # (i,j) pairs, each in a separate submission : the OS may silently kill
-        # long running GPU commands (e.g. the GPU watchdog on macOS).
-        nblocks = (nx + self.block_size - 1) // self.block_size
-        chunk = max(1, max_interactions // (self.block_size * max(ny, 1)))
-        for block_offset in range(0, nblocks, chunk):
-            nblocks_chunk = min(chunk, nblocks - block_offset)
+        # The computation is split into dispatches of a bounded number of (i,j)
+        # pairs, each in a separate submission : the OS may silently kill long
+        # running GPU commands (e.g. the GPU watchdog on macOS). Each dispatch
+        # handles all the rows (up to rows_chunk) for a range of j indices,
+        # to keep enough workgroups busy.
+        bs = self.block_size
+        dimvars = sum(self.params.dimsx) + sum(self.params.dimsy)
+        budget = max_interactions * 8 // max(8, dimvars)
+        rows_chunk = max(1, budget // bs // bs) * bs
+        for i0 in range(0, nx, rows_chunk):
+            nrows = min(rows_chunk, nx - i0)
+            cols_chunk = max(1, budget // nrows // bs) * bs
             # 1D grid of workgroups, folded in 2D if needed
-            grid_x = min(nblocks_chunk, max_workgroups)
-            grid_y = (nblocks_chunk + grid_x - 1) // grid_x
-            device.queue.write_buffer(
-                sizes, 0, np.array([nx, ny, block_offset, 0], dtype=np.int32)
-            )
-            command_encoder = device.create_command_encoder()
-            compute_pass = command_encoder.begin_compute_pass()
-            compute_pass.set_pipeline(self.pipeline)
-            compute_pass.set_bind_group(0, bind_group)
-            compute_pass.dispatch_workgroups(grid_x, grid_y, 1)
-            compute_pass.end()
-            device.queue.submit([command_encoder.finish()])
+            nblocks = (nrows + bs - 1) // bs
+            grid_x = min(nblocks, max_workgroups)
+            grid_y = (nblocks + grid_x - 1) // grid_x
+            # N.B. if ny=0, we still need one dispatch to initialize the output
+            for j0 in range(0, max(ny, 1), cols_chunk):
+                j1 = min(ny, j0 + cols_chunk)
+                device.queue.write_buffer(
+                    sizes,
+                    0,
+                    np.array([nx, ny, i0 // bs, j0, j1, 0, 0, 0], dtype=np.int32),
+                )
+                command_encoder = device.create_command_encoder()
+                compute_pass = command_encoder.begin_compute_pass()
+                compute_pass.set_pipeline(self.pipeline)
+                compute_pass.set_bind_group(0, bind_group)
+                compute_pass.dispatch_workgroups(grid_x, grid_y, 1)
+                compute_pass.end()
+                device.queue.submit([command_encoder.finish()])
 
         res = np.frombuffer(device.queue.read_buffer(out_buffer), dtype=np.float32)
         res = res[: nx * self.params.dim].reshape(self.out.shape)

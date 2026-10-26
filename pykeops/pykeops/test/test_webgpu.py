@@ -106,16 +106,16 @@ def test_sinxdivx():
     compare_to_cpu("SinXDivX(x)+XLogX(Abs(y))", aliases, args, tol=1e-3)
 
 
-def test_chunked_dispatch(monkeypatch):
-    # long computations are split into several dispatches, which we force here
-    # with a small number of interactions per dispatch
+@pytest.mark.parametrize("reduction_op", ["Sum", "LogSumExp", "ArgMin"])
+def test_chunked_dispatch(monkeypatch, reduction_op):
+    # long computations are split into several dispatches, over i and j,
+    # which we force here with a small number of interactions per dispatch
     from pykeops.common.keops_io.webgpu import LoadKeOps_webgpu
 
     monkeypatch.setattr(LoadKeOps_webgpu, "max_interactions", 5000)
     aliases = ["x=Vi(3)", "y=Vj(3)"]
-    compare_to_cpu(
-        "-SqDist(x,y)", aliases, (rand(3001, 3), rand(40, 3)), reduction_op="LogSumExp"
-    )
+    args = (rand(3001, 3), rand(1000, 3))
+    compare_to_cpu("-SqDist(x,y)", aliases, args, reduction_op=reduction_op)
 
 
 def test_large_dimy():

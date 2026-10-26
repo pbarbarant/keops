@@ -5,6 +5,7 @@ from keopscore.utils.code_gen_utils import (
     c_variable,
     c_array,
     pointer,
+    VectCopy,
     wgsl_codegen,
 )
 from keopscore.utils.messages import KeOps_Error
@@ -63,9 +64,13 @@ class WgslReduc1D(MapReduce, Wgsl_link_compile):
             yjrel = c_array(dtype, dimy, f"(yj + jrel * {dimy})")
             table = varloader.table(self.xi, yjrel, self.param_loc)
             jreltile = c_variable("signed long int", "(jrel + jstart)")
+            # accumulators saved between two dispatches
+            acci = c_array(
+                acc.dtype, red_formula.dimred, f"(keops_acc + i * {red_formula.dimred})"
+            )
 
             self.code = f"""
-                        {wgsl_bindings(varloader.indsi + varloader.indsj + varloader.indsp)}
+                        {wgsl_bindings(varloader.indsi + varloader.indsj + varloader.indsp, acc=True)}
 
                         var<workgroup> yj: array<f32, {block_size * max(dimy, 1)}>;
 
@@ -89,24 +94,28 @@ class WgslReduc1D(MapReduce, Wgsl_link_compile):
                           {sum_scheme.declare_temporary_accumulator()}
 
                           if ({i.id} < nx) {{
-                            {red_formula.InitializeReduction(acc)} // acc = 0
+                            if (sizes.jbegin == 0) {{
+                              {red_formula.InitializeReduction(acc)} // acc = 0
+                            }} else {{
+                              {VectCopy(acc, acci)} // resume the reduction of the previous dispatch
+                            }}
                             {sum_scheme.initialize_temporary_accumulator_first_init()}
                             {varloader.load_vars('i', xi, args, row_index=i)} // load xi variables from global memory to local thread memory
                           }}
 
-                          for (var jstart: i32 = 0; jstart < ny; jstart += {block_size}) {{
+                          for (var jstart: i32 = sizes.jbegin; jstart < sizes.jend; jstart += {block_size}) {{
 
                             // get the current column
                             let {j.id} = jstart + tid;
 
-                            if ({j.id} < ny) {{ // we load yj from device global memory only if j<ny
+                            if ({j.id} < sizes.jend) {{ // we load yj from device global memory only if j<jend
                               {varloader.load_vars("j", yjloc, args, row_index=j)}
                             }}
                             workgroupBarrier();
 
                             if ({i.id} < nx) {{ // we compute x1i only if needed
                               {sum_scheme.initialize_temporary_accumulator_block_init()}
-                              for (var jrel: i32 = 0; (jrel < {block_size}) && (jrel < ny - jstart); jrel++) {{
+                              for (var jrel: i32 = 0; (jrel < {block_size}) && (jrel < sizes.jend - jstart); jrel++) {{
                                 {red_formula.formula(fout, table)} // Call the function, which outputs results in fout
                                 {sum_scheme.accumulate_result(acc, fout, jreltile)}
                               }}
@@ -115,7 +124,11 @@ class WgslReduc1D(MapReduce, Wgsl_link_compile):
                             workgroupBarrier();
                           }}
                           if ({i.id} < nx) {{
-                            {red_formula.FinalizeOutput(acc, outi, i)}
+                            if (sizes.jend == ny) {{
+                              {red_formula.FinalizeOutput(acc, outi, i)}
+                            }} else {{
+                              {VectCopy(acci, acc)} // save the reduction for the next dispatch
+                            }}
                           }}
 
                         }}

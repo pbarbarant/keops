@@ -7,25 +7,31 @@ from keopscore.utils.code_gen_utils import (
 )
 
 
-def wgsl_bindings(inds=()):
-    # WGSL declarations of the kernel inputs : sizes (nx, ny, block_offset) at binding 0,
-    # output at binding 1, and input tensor k at binding k+2.
-    # N.B. only the inputs used by the kernel (inds) can be declared, since
-    # unused bindings are removed by the WGSL compiler.
-    # block_offset is the index of the first workgroup, used when the computation
-    # is split into several dispatches.
+def wgsl_bindings(inds=(), acc=False):
+    # WGSL declarations of the kernel inputs : sizes at binding 0, output at
+    # binding 1, accumulators at binding 2 and input tensor k at binding k+3.
+    # N.B. only the inputs used by the kernel can be declared, since unused
+    # bindings are removed by the WGSL compiler.
+    # The computation may be split into several dispatches, each one for
+    # the workgroups starting at block_offset and the j indices in [jbegin, jend).
+    # Between two dispatches the accumulators are saved in keops_acc.
     string = """
                         struct Sizes {
                           nx: i32,
                           ny: i32,
                           block_offset: i32,
+                          jbegin: i32,
+                          jend: i32,
                         }
                         @group(0) @binding(0) var<uniform> sizes: Sizes;
                         @group(0) @binding(1) var<storage, read_write> keops_out: array<f32>;
             """
+    if acc:
+        string += """
+                        @group(0) @binding(2) var<storage, read_write> keops_acc: array<f32>;"""
     for k in sorted(set(inds)):
         string += f"""
-                        @group(0) @binding({k + 2}) var<storage, read> arg_{k}: array<f32>;"""
+                        @group(0) @binding({k + 3}) var<storage, read> arg_{k}: array<f32>;"""
     return string
 
 
