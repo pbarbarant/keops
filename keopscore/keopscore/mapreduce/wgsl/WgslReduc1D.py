@@ -11,18 +11,19 @@ from keopscore.utils.code_gen_utils import (
 from keopscore.utils.messages import KeOps_Error
 
 
-def wgsl_nvec4(dimy):
-    # number of vec4<f32> used to store the j variables of one thread in
-    # workgroup memory : vec4 loads are much faster than scalar loads.
-    return max(1, (dimy + 3) // 4)
+def wgsl_yj_stride(dimy):
+    # number of floats used to store the j variables of one thread in workgroup
+    # memory, padded to a multiple of 4 : the rows are then 16 bytes aligned and
+    # the GPU compiler can load them with vec4 (128 bits) instructions.
+    return 4 * max(1, (dimy + 3) // 4)
 
 
 def wgsl_block_size(dimy):
     # Number of threads per workgroup. The workgroup (shared) memory must hold
-    # block_size*wgsl_nvec4(dimy) vec4, within the 16kB guaranteed by WebGPU
+    # block_size*wgsl_yj_stride(dimy) floats, within the 16kB guaranteed by WebGPU
     # (maxComputeWorkgroupStorageSize). N.B. this function is also used by the
     # pykeops launcher to dispatch the kernel.
-    block_size = min(256, 16384 // (16 * wgsl_nvec4(dimy)))
+    block_size = min(256, 16384 // (4 * wgsl_yj_stride(dimy)))
     if block_size < 1:
         KeOps_Error(
             f"Total dimension of j variables ({dimy}) is too large for the WebGPU backend."
@@ -66,19 +67,9 @@ class WgslReduc1D(MapReduce, Wgsl_link_compile):
 
             param_loc = self.param_loc
             xi = self.xi
-            # the j variables are copied between local arrays yjloc, yjrel and
-            # the workgroup memory yj, which stores them as nv vec4 per thread
-            nv = wgsl_nvec4(dimy)
-            yjloc = c_array(dtype, 4 * nv, "yjloc")
-            yjrel = c_array(dtype, 4 * nv, "yjrel")
-            store_yj = "".join(
-                f"yj[tid * {nv} + {q}] = vec4<f32>({', '.join(f'yjloc[{4 * q + k}]' for k in range(4))});\n"
-                for q in range(nv)
-            )
-            load_yj = "".join(
-                f"{{ let v = yj[jrel * {nv} + {q}]; {' '.join(f'yjrel[{4 * q + k}] = v.{c};' for k, c in enumerate('xyzw'))} }}\n"
-                for q in range(nv)
-            )
+            stride = wgsl_yj_stride(dimy)
+            yjloc = c_array(dtype, dimy, f"(yj + tid * {stride})")
+            yjrel = c_array(dtype, dimy, f"(yj + jrel * {stride})")
             table = varloader.table(self.xi, yjrel, self.param_loc)
             jreltile = c_variable("signed long int", "(jrel + jstart)")
             # accumulators saved between two dispatches
@@ -89,7 +80,7 @@ class WgslReduc1D(MapReduce, Wgsl_link_compile):
             self.code = f"""
                         {wgsl_bindings(varloader.indsi + varloader.indsj + varloader.indsp, acc=True)}
 
-                        var<workgroup> yj: array<vec4<f32>, {block_size * nv}>;
+                        var<workgroup> yj: array<f32, {block_size * stride}>;
 
                         @compute @workgroup_size({block_size})
                         fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
@@ -126,9 +117,7 @@ class WgslReduc1D(MapReduce, Wgsl_link_compile):
                             let {j.id} = jstart + tid;
 
                             if ({j.id} < sizes.jend) {{ // we load yj from device global memory only if j<jend
-                              {yjloc.declare()}
                               {varloader.load_vars("j", yjloc, args, row_index=j)}
-                              {store_yj}
                             }}
                             workgroupBarrier();
 
@@ -137,8 +126,6 @@ class WgslReduc1D(MapReduce, Wgsl_link_compile):
                               // a single loop bound, which compiles to a much faster loop
                               let jlim = min({block_size}, sizes.jend - jstart);
                               for (var jrel: i32 = 0; jrel < jlim; jrel++) {{
-                                {yjrel.declare()}
-                                {load_yj}
                                 {red_formula.formula(fout, table)} // Call the function, which outputs results in fout
                                 {sum_scheme.accumulate_result(acc, fout, jreltile)}
                               }}
