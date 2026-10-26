@@ -38,6 +38,36 @@ def get_device():
     return _device
 
 
+def create_shader_module(device, code):
+    # wgpu adds runtime checks (bounds checks on every array access, loop
+    # bounding) to all shaders, which halves the throughput of KeOps kernels.
+    # The generated code already guards its indices (i < nx, j < jend), so we
+    # disable them with wgpuDeviceCreateShaderModuleTrusted from wgpu-native,
+    # which wgpu-py does not wrap: we build the descriptor as in
+    # GPUDevice.create_shader_module.
+    try:
+        from wgpu.backends.wgpu_native import _api, ffi, lib
+
+        source = _api.new_struct_p(
+            "WGPUShaderSourceWGSL *", code=_api.to_c_string_view(code)
+        )
+        source[0].chain.next = ffi.NULL
+        source[0].chain.sType = lib.WGPUSType_ShaderSourceWGSL
+        descriptor = _api.new_struct_p(
+            "WGPUShaderModuleDescriptor *",
+            nextInChain=ffi.cast("WGPUChainedStruct *", source),
+            label=_api.to_c_string_view(""),
+        )
+        create_trusted = _api.libf.wgpuDeviceCreateShaderModuleTrusted
+    except (ImportError, AttributeError):
+        # other wgpu-py versions: fall back to the checked shader module
+        return device.create_shader_module(code=code)
+    id = create_trusted(device._internal, descriptor, lib.WGPUShaderRuntimeChecks_None)
+    if id == ffi.NULL:
+        raise RuntimeError("[pyKeOps] WebGPU shader module creation failed.")
+    return _api.GPUShaderModule("", id, device)
+
+
 class LoadKeOps_webgpu_class(LoadKeOps):
     def __init__(self, *args, fast_init=False):
         super().__init__(*args, fast_init=fast_init)
@@ -59,7 +89,7 @@ class LoadKeOps_webgpu_class(LoadKeOps):
         device = get_device()
         with open(self.params.low_level_code_file, "r") as f:
             code = f.read()
-        shader_module = device.create_shader_module(code=code)
+        shader_module = create_shader_module(device, code)
         self.pipeline = device.create_compute_pipeline(
             layout="auto", compute={"module": shader_module, "entry_point": "main"}
         )
